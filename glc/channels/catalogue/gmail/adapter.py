@@ -154,6 +154,18 @@ class Adapter(ChannelAdapter):
         # senders are dropped at the adapter level to avoid flooding the agent.
         trust_level = self._resolve_trust_level(from_addr)
 
+        # SECURITY: verify SPF/DKIM/DMARC before honoring elevated trust.
+        # The From: header is user-controlled — an attacker can spoof it.
+        # If email authentication fails, downgrade to untrusted regardless
+        # of what the pairing store says.
+        if trust_level != "untrusted" and not self._verify_sender_authentication(email_msg):
+            logger.warning(
+                "Sender authentication failed for %s — downgrading trust from %s to untrusted",
+                from_addr,
+                trust_level,
+            )
+            trust_level = "untrusted"
+
         if self.config.get("is_public_channel") and not self._check_allowlist(from_addr, trust_level):
             return None  # type: ignore[return-value]
 
@@ -201,6 +213,15 @@ class Adapter(ChannelAdapter):
             from_addr = self._extract_email(from_addr_raw)
 
             trust_level = self._resolve_trust_level(from_addr)
+
+            # SECURITY: verify SPF/DKIM/DMARC before honoring elevated trust
+            if trust_level != "untrusted" and not self._verify_sender_authentication(email_msg):
+                logger.warning(
+                    "Sender authentication failed for %s — downgrading trust from %s to untrusted",
+                    from_addr,
+                    trust_level,
+                )
+                trust_level = "untrusted"
 
             if self.config.get("is_public_channel") and not self._check_allowlist(from_addr, trust_level):
                 continue
@@ -459,6 +480,50 @@ class Adapter(ChannelAdapter):
             'untrusted' for unknown senders
         """
         return classify("gmail", sender_email)
+
+    def _verify_sender_authentication(self, msg: Any) -> bool:
+        """Verify SPF, DKIM, and DMARC results from Gmail's headers.
+
+        The From: header is user-controlled — an attacker can set it to
+        any address. Gmail attaches an Authentication-Results header
+        showing whether the message was actually authenticated by the
+        claimed sending domain.
+
+        We require ALL THREE (SPF, DKIM, DMARC) to pass before honoring
+        the claimed From: identity for trust classification. If any fail,
+        the sender's identity is unverified.
+
+        If the config flag `require_sender_auth` is True (production
+        default), missing Authentication-Results also fails verification.
+        If False (test mode with mocks that don't inject this header),
+        missing header is treated as "not present, skip check".
+
+        Returns:
+            True if authentication passes (or is not required in test mode),
+            False if verification fails.
+        """
+        auth_results = msg.get_all("Authentication-Results") or []
+
+        if not auth_results:
+            # Header missing. Real Gmail ALWAYS adds it — absence means
+            # either a test mock, or a MITM stripped the header.
+            require_auth = self.config.get("require_sender_auth", False)
+            if require_auth:
+                logger.warning(
+                    "Authentication-Results header missing — treating as unverified"
+                )
+                return False
+            # Permissive fallback for test/mock environments.
+            return True
+
+        # Concatenate all Authentication-Results headers (Gmail may add multiple)
+        combined = " ".join(str(h).lower() for h in auth_results)
+
+        spf_pass = "spf=pass" in combined
+        dkim_pass = "dkim=pass" in combined
+        dmarc_pass = "dmarc=pass" in combined
+
+        return spf_pass and dkim_pass and dmarc_pass
 
     def _check_allowlist(self, sender_email: str, trust_level: str) -> bool:
         """Check if a sender may be processed in a public channel.

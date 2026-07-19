@@ -216,7 +216,7 @@ def main():
 
     last_history_id = int(profile["historyId"])
     gmail_client = LiveGmailClient(service)
-    adapter = Adapter(config={"client": gmail_client})
+    adapter = Adapter(config={"client": gmail_client, "require_sender_auth": True})
 
     processed_ids: set[str] = set()
 
